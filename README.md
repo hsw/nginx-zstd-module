@@ -1586,10 +1586,12 @@ opt-in ratio lever (`zstd_long`) for specific workloads.
 # Operations
 
 **Reloads (`nginx -s reload`).** Compression state is per request: a
-`ZSTD_CCtx` is created/reset per request and freed via an nginx pool
-cleanup. A graceful reload spins up new workers and drains old ones
-normally — in-flight responses on old workers finish on their existing
-context; new requests use new workers. There is no shared compression
+`ZSTD_CCtx` is borrowed from the worker's context ring (or created for
+that request) and given back once the response's zstd frame is complete
+or the filter fails; the request pool's cleanup covers every other exit.
+A graceful reload spins up new workers and drains old ones normally —
+in-flight responses on old workers finish on their existing context;
+new requests use new workers. There is no shared compression
 state to corrupt across a reload. The `zstd_dict_file` `ZSTD_CDict` is
 loaded once per cycle and freed on the old cycle's cleanup; a
 reload-leak regression for exactly this runs under ASAN in CI

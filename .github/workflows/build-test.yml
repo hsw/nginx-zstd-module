@@ -2052,6 +2052,22 @@ jobs:
             --port 18116
           echo "✓ worker CCtx cache regression passed"
 
+      - name: Run CCtx early-return regression
+        timeout-minutes: 6
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          # A request gives its CCtx back when its frame ends (or the
+          # body filter fails), not when the request does. Asserted from
+          # the debug witnesses: a second request reuses the slot while
+          # the first is still draining, a late pool cleanup is a no-op
+          # on a slot already re-lent, the uncached and failure exits
+          # return too, and the pool cleanup returns the context of a
+          # request ended mid-frame. Every body decodes byte-exact.
+          python3 ci/tools/test_cctx_early_release.py \
+            --nginx-binary "$TEST_NGINX_BINARY" \
+            --port 18119 --backend-port 18126
+          echo "✓ CCtx early-return regression passed"
+
       - name: Run reload-under-load correctness regression
         timeout-minutes: 6
         run: |
@@ -2359,6 +2375,14 @@ jobs:
           python3 ci/tools/test_concurrent_cctx_isolation.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 18098 \
             --backend-port 18099 --concurrency 8 --rounds 3
+          # CCtx early return under ASAN/UBSAN, --log-level warn (same
+          # UBSAN trap as test_slow_drain.py above): a non-idempotent return
+          # shows as a decode failure or an ASan double free in the LSan
+          # verdict, a missed pool-cleanup return as a leak; the early
+          # return itself is asserted in the debug lanes.
+          python3 ci/tools/test_cctx_early_release.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18125 \
+            --backend-port 18127 --log-level warn
           # dcz under ASAN/UBSAN: ZSTD_CCtx_refPrefix references
           # config-pool memory from the request path and the 40-byte
           # frame header is hand-assembled — both lifetime/OOB classes.

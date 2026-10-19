@@ -815,6 +815,8 @@ typedef enum {
 } ngx_http_zstd_action_t;
 
 
+typedef struct ngx_http_zstd_cctx_slot_s  ngx_http_zstd_cctx_slot_t;
+
 typedef struct {
     ngx_chain_t                 *in;
     ngx_chain_t                **last_in;
@@ -831,6 +833,9 @@ typedef struct {
     ZSTD_outBuffer               buffer_out;
 
     ZSTD_CCtx                   *cctx;
+
+    /* ring slot cctx is lent from; NULL if uncached or not held */
+    ngx_http_zstd_cctx_slot_t   *lender;
 
     /* dictionary negotiated for this response via Available-Dictionary;
      * NULL means plain zstd. Points into the loc conf's dcz_dicts array
@@ -1041,13 +1046,14 @@ static char *ngx_http_zstd_set_bypass_vary(ngx_conf_t *cf,
 static char *ngx_http_zstd_set_enable_slot(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static void ngx_http_zstd_cleanup_dict(void *data);
-static void ngx_http_zstd_cleanup_cctx(void *data);
 #if (NGX_HTTP_ZSTD_HAVE_LIBCRYPTO)
 static void ngx_http_zstd_cleanup_evp_md_ctx(void *data);
 static void ngx_http_zstd_init_evp_md_ctx(ngx_conf_t *cf,
     ngx_http_zstd_main_conf_t *zmcf);
 #endif
-static void ngx_http_zstd_release_cctx(void *data);
+static void ngx_http_zstd_return_cctx(ngx_http_zstd_ctx_t *ctx,
+    ngx_log_t *log);
+static void ngx_http_zstd_cleanup_ctx(void *data);
 static ngx_int_t ngx_http_zstd_acquire_cctx(ngx_http_request_t *r,
     ngx_http_zstd_ctx_t *ctx, ngx_http_zstd_loc_conf_t *zlcf);
 static void ngx_http_zstd_exit_process(ngx_cycle_t *cycle);
@@ -1090,11 +1096,11 @@ static ZSTD_CDict *ngx_http_zstd_dcz_cdict_lookup(
  * Why this does NOT reintroduce the shared-context bug 774b4a5 fixed: that
  * commit's defect was a context shared between CONCURRENT requests (interleaved
  * compression state). Here the cache lends the context to exactly one
- * request at a time -- `busy` is set on loan and cleared by the request
- * pool's cleanup handler -- so any second concurrent claimant (a subrequest
- * compressing while the main request is mid-stream) transparently gets its
- * own per-request context instead. The per-request ownership model is
- * preserved; only the allocation is amortised.
+ * request at a time -- `busy` is set on loan and cleared only by the
+ * borrowing request (see ngx_http_zstd_return_cctx()) -- so a second
+ * request compressing on the same worker at the same time never shares it:
+ * it gets another slot or its own per-request context. The per-request
+ * ownership model is preserved; only the allocation is amortised.
  *
  * Why there is no runtime memory cap: ZSTD_sizeof_CCtx() does not shrink on
  * reset, so an unbounded cache would pin each worker's RSS at its
@@ -1155,9 +1161,9 @@ static ZSTD_CDict *ngx_http_zstd_dcz_cdict_lookup(
  *    overlapping request on a worker always fell through to a per-request
  *    context because the one slot was busy. Isolation is preserved by the
  *    same rule as before, applied per slot: `busy` is set on loan and
- *    cleared only by the borrowing request's pool cleanup, so a slot is
- *    lent to at most one request at a time and two concurrent requests
- *    always land on different slots (or on the per-request path).
+ *    cleared only by the borrowing request, so a slot is lent to at most one
+ *    request at a time and two concurrent requests always land on different
+ *    slots (or on the per-request path).
  *
  *  - Locations with DIFFERENT profiles no longer evict each other. With one
  *    slot, two locations differing only in zstd_window_log or zstd_long
@@ -1197,11 +1203,11 @@ typedef struct {
     uint64_t key;
 } ngx_http_zstd_cctx_profile_t;
 
-typedef struct {
+struct ngx_http_zstd_cctx_slot_s {
     ZSTD_CCtx                       *cctx;
     ngx_http_zstd_cctx_profile_t     profile;
     ngx_uint_t                       busy;
-} ngx_http_zstd_cctx_slot_t;
+};
 
 static ngx_http_zstd_cctx_slot_t
     ngx_http_zstd_worker_cctx_slots[NGX_HTTP_ZSTD_CCTX_SLOTS];
@@ -2661,6 +2667,8 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 #ifdef NGX_TEST_HARNESS
             ngx_http_zstd_probe_snapshot_ctx(ctx);
 #endif
+            ngx_http_zstd_return_cctx(ctx, r->connection->log);
+
             return rc;
         }
     }
@@ -2669,6 +2677,13 @@ failed:
 
     ctx->aborted = 1;
     ctx->done = 1;
+
+    /*
+     * An error returns the context now, not at request end: a loan gets the
+     * same session-only reset, so the slot is not poisoned; an uncached
+     * context is freed.
+     */
+    ngx_http_zstd_return_cctx(ctx, r->connection->log);
 
     return NGX_ERROR;
 }
@@ -3545,20 +3560,20 @@ ngx_http_zstd_set_param(ngx_http_request_t *r, ZSTD_CCtx *cctx,
  * fresh per-request context.
  *
  * Extracted from ngx_http_zstd_filter_init_cctx() so the loan bookkeeping --
- * which cleanup handler owns the context, and when `busy` may be set -- reads
- * as one unit instead of as five branches inside the parameter-setting code.
+ * where the context comes from, and when `busy` may be set -- reads as one
+ * unit instead of as five branches inside the parameter-setting code.
  *
- * On success ctx->cctx is non-NULL and a pool cleanup owns it: either
- * ngx_http_zstd_release_cctx (returns the loan) or ngx_http_zstd_cleanup_cctx
- * (frees an unshared context).
+ * On success ctx->cctx is non-NULL, ctx->lender is its lending slot (NULL
+ * for an unshared context), and ngx_http_zstd_return_cctx() gives it back,
+ * from the body filter or else from the request pool's cleanup.
  */
 static ngx_int_t
 ngx_http_zstd_acquire_cctx(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
     ngx_http_zstd_loc_conf_t *zlcf)
 {
-    ngx_uint_t                      i, borrowed;
+    ngx_uint_t                      i;
     ngx_pool_cleanup_t             *cln;
-    ngx_http_zstd_cctx_slot_t      *slot, *free_slot, *lender;
+    ngx_http_zstd_cctx_slot_t      *slot, *free_slot;
     ngx_http_zstd_cctx_profile_t    zlcf_profile;
     ngx_int_t                       eff_window_log;
 
@@ -3571,6 +3586,10 @@ ngx_http_zstd_acquire_cctx(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
     if (cln == NULL) {
         return NGX_ERROR;
     }
+
+    /* A no-op until ctx->cctx is set. */
+    cln->handler = ngx_http_zstd_cleanup_ctx;
+    cln->data = ctx;
 
     /*
      * The window this request will really compress at -- see
@@ -3598,9 +3617,7 @@ ngx_http_zstd_acquire_cctx(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
     ngx_http_zstd_cctx_profile_from_conf_wlog(&zlcf_profile, zlcf,
                                               eff_window_log);
 
-    borrowed = 0;
     free_slot = NULL;
-    lender = NULL;
 
     /*
      * Borrow a slot whose context is free and was built for this location's
@@ -3635,8 +3652,7 @@ ngx_http_zstd_acquire_cctx(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
         {
             ctx->cctx = slot->cctx;
             slot->busy = 1;
-            lender = slot;
-            borrowed = 1;
+            ctx->lender = slot;
 
 #if (NGX_DEBUG)
             if (r->connection->log->log_level & NGX_LOG_DEBUG_HTTP) {
@@ -3665,7 +3681,7 @@ ngx_http_zstd_acquire_cctx(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
         }
     }
 
-    if (!borrowed) {
+    if (ctx->lender == NULL) {
         ctx->cctx = ZSTD_createCCtx();
         if (ctx->cctx == NULL) {
             ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
@@ -3694,27 +3710,12 @@ ngx_http_zstd_acquire_cctx(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
             ngx_http_zstd_cctx_profile_from_conf_wlog(&free_slot->profile,
                 zlcf, eff_window_log);
             free_slot->busy = 1;
-            lender = free_slot;
-            borrowed = 1;
+            ctx->lender = free_slot;
         }
 
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "zstd: created cctx %p (cached:%ui)",
-                       ctx->cctx, borrowed);
-    }
-
-    /*
-     * The two handlers take different data: release_cctx() returns a loan
-     * and is given its lending slot, cleanup_cctx() owns an uncached
-     * context outright and is given the context itself.
-     */
-    if (borrowed) {
-        cln->handler = ngx_http_zstd_release_cctx;
-        cln->data = lender;
-
-    } else {
-        cln->handler = ngx_http_zstd_cleanup_cctx;
-        cln->data = ctx->cctx;
+                       ctx->cctx, (ngx_uint_t) (ctx->lender != NULL));
     }
 
     return NGX_OK;
@@ -6000,17 +6001,6 @@ ngx_http_zstd_bytes_variable(ngx_http_request_t *r,
 }
 
 
-static void
-ngx_http_zstd_cleanup_cctx(void *data)
-{
-    ZSTD_CCtx *cctx = data;
-
-    if (cctx != NULL) {
-        ZSTD_freeCCtx(cctx);
-    }
-}
-
-
 #if (NGX_HTTP_ZSTD_HAVE_LIBCRYPTO)
 static void
 ngx_http_zstd_cleanup_evp_md_ctx(void *data)
@@ -6045,52 +6035,70 @@ ngx_http_zstd_init_evp_md_ctx(ngx_conf_t *cf,
 
 
 /*
- * Return a borrowed worker context to the cache at request end.
+ * Give the request's CCtx back: from the body filter once it is done with it
+ * (frame complete or failed), else from the request pool's cleanup, so every
+ * exit path (client abort, upstream error) returns it and `busy` is a
+ * reliable loan flag rather than a leak waiting for the one path that forgot
+ * to clear it.
  *
- * Runs from the request pool's cleanup list, so it fires on every exit path --
- * normal completion, client abort, upstream error, worker shutdown of a live
- * request -- which is what makes `busy` a reliable loan flag rather than a leak
- * waiting for the one path that forgot to clear it.
+ * Idempotent: the first call clears ctx->cctx, so the pool cleanup after an
+ * early return is a no-op and never touches a slot since lent to another
+ * request. Nothing reads ctx->cctx after that: both callers in the body
+ * filter set ctx->done, and its entry check passes every later call through.
  *
- * The session is reset HERE, not only on the next acquire: a request may be
- * abandoned mid-stream (client reset on a partially compressed response), and
- * leaving that half-finished frame state resident means the cached context
- * holds the previous response's compression state until something else
- * claims it.
- * init_cctx does reset before reuse, so this is defence in depth against a
- * future caller that forgets. It does NOT release the session's internal
- * buffers: measured on libzstd 1.5.7, ZSTD_sizeof_CCtx() is byte-identical
- * before and after ZSTD_reset_session_only at levels 1/7/13/19, for both a
- * completed stream and one abandoned mid-stream. The workspace is
- * level-driven and stays pinned until the slot is freed or replaced; this
- * reset only clears session/frame state, not memory.
+ * A loan's session is reset HERE, not only on the next acquire: a request may
+ * be abandoned mid-stream (client reset on a partially compressed response),
+ * and leaving that half-finished frame state resident means the cached
+ * context holds the previous response's compression state until something
+ * else claims it. init_cctx does reset before reuse, so this is defence in
+ * depth against a future caller that forgets. It does NOT release memory:
+ * measured on libzstd 1.5.7, ZSTD_sizeof_CCtx() is byte-identical before and
+ * after ZSTD_reset_session_only, whether the stream completed or not.
  */
 static void
-ngx_http_zstd_release_cctx(void *data)
+ngx_http_zstd_return_cctx(ngx_http_zstd_ctx_t *ctx, ngx_log_t *log)
 {
-    ngx_http_zstd_cctx_slot_t  *slot = data;
-
-    if (slot == NULL || slot->cctx == NULL) {
+    if (ctx->cctx == NULL) {
         return;
     }
 
-    /*
-     * The lending slot is handed straight to this handler: acquire_cctx()
-     * already had it, and nginx's cleanup data is an opaque void *, not a
-     * CCtx-only contract. Returning the loan is therefore O(1) with no
-     * search.
-     *
-     * This replaced a pointer-identity walk over the ring. That walk also
-     * carried a "not found -> ZSTD_freeCCtx()" fallback for a slot replaced
-     * mid-loan; the fallback was already unreachable, because a slot on loan
-     * is never evicted or re-seeded (acquire_cctx() skips every busy slot,
-     * and only ever seeds one that is empty AND not busy). Any future
-     * eviction policy must preserve that invariant -- evicting a busy slot
-     * would free a context a live request is still writing into, which no
-     * amount of searching here could make safe.
-     */
-    (void) ZSTD_CCtx_reset(slot->cctx, ZSTD_reset_session_only);
-    slot->busy = 0;
+#if (NGX_DEBUG)
+    /* log is NULL from the pool cleanup: only an early return is logged */
+    if (log != NULL) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "zstd: returned cctx %p before request end (cached:%ui)",
+                       ctx->cctx, (ngx_uint_t) (ctx->lender != NULL));
+    }
+#endif
+
+    if (ctx->lender != NULL) {
+        /*
+         * ctx->cctx is still ctx->lender->cctx: a slot on loan is never
+         * evicted or re-seeded (acquire_cctx() skips every busy slot, and
+         * only ever seeds one that is empty AND not busy). Any future
+         * eviction policy must preserve that invariant -- evicting a busy
+         * slot would free a context a live request is still writing into.
+         * The one exception is exit_process(), which frees every slot and
+         * clears its cctx; a call after it leaves the slot alone.
+         */
+        if (ctx->lender->cctx != NULL) {
+            (void) ZSTD_CCtx_reset(ctx->cctx, ZSTD_reset_session_only);
+            ctx->lender->busy = 0;
+        }
+
+    } else {
+        ZSTD_freeCCtx(ctx->cctx);
+    }
+
+    ctx->cctx = NULL;
+    ctx->lender = NULL;
+}
+
+
+static void
+ngx_http_zstd_cleanup_ctx(void *data)
+{
+    ngx_http_zstd_return_cctx(data, NULL);
 }
 
 
@@ -6163,9 +6171,10 @@ ngx_http_zstd_init_module(ngx_cycle_t *cycle)
  * are not destroyed first, and on that path never are. Freeing a lent context
  * is nonetheless unobservable, and that, not "the borrower is already gone",
  * is why it is safe: the process exit()s immediately after these handlers, so
- * no borrower's pool cleanup -- hence no ngx_http_zstd_release_cctx() -- ever
- * runs again on the freed pointer. Anything that reintroduced an event-loop
- * turn after this point would invalidate that reasoning, not merely slow it.
+ * no borrower's ngx_http_zstd_return_cctx() -- from its body filter or its
+ * pool cleanup -- ever runs again on the freed pointer. Anything that
+ * reintroduced an event-loop turn after this point would invalidate that
+ * reasoning, not merely slow it.
  */
 static void
 ngx_http_zstd_exit_process(ngx_cycle_t *cycle)

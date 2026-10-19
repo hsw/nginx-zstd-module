@@ -27,9 +27,10 @@ What it measures
 
 Why bodies are proxied through a paced backend, not served static
 -------------------------------------------------------------------
-The worker-lifetime CCtx loan (acquire_cctx sets the busy flag; only
-request CLEANUP clears it -- src/ngx_http_zstd_filter_module.c:1847 and
-:2896) is held for the FULL lifetime of one compression, so two
+The worker-lifetime CCtx loan (acquire_cctx sets the busy flag;
+return_cctx clears it when the frame ends, or at request cleanup -- see
+src/ngx_http_zstd_filter_module.c) is held for the FULL lifetime of one
+compression, so two
 compressions only contend when their lifetimes actually overlap on one
 worker. A location serving a static, fully-buffered, known-length body
 from page cache completes inside a single event-loop turn; `wrk`
@@ -176,8 +177,8 @@ assert DEBUG_BODY in BODY_SIZES
 CREATE_WITNESS = "zstd: created cctx"
 REUSE_WITNESS = "zstd: reusing worker cctx"
 
-# The loan (ngx_http_zstd_worker_cctx_busy) is held from acquire_cctx
-# until REQUEST CLEANUP, so two compressions only actually CONTEND when
+# The loan (a ring slot's busy flag) is held from acquire_cctx until
+# the frame ends, so two compressions only actually CONTEND when
 # their lifetimes overlap on one worker. A location that serves a static,
 # fully-buffered, known-length body from page cache completes inside one
 # event-loop turn -- wrk connections then queue rather than overlap, and
@@ -471,9 +472,9 @@ class PacedBackend(threading.Thread):
     pass. Proxied through nginx with `proxy_buffering off`, the filter
     processes each chunk as it streams in rather than compressing one
     fully-buffered body in a single event-loop turn -- so the
-    worker-lifetime CCtx loan (acquired at acquire_cctx, released only
-    at request cleanup, per
-    src/ngx_http_zstd_filter_module.c:1847/:2896) stays held for the
+    worker-lifetime CCtx loan (acquired at acquire_cctx, returned by
+    return_cctx when the frame ends, per
+    src/ngx_http_zstd_filter_module.c) stays held for the
     whole paced duration instead of being taken and returned before the
     next request is even accepted. A static, fully-buffered,
     known-length body completes inside one event-loop turn and can

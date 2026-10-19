@@ -167,6 +167,8 @@ python3 ci/tools/test_dcz_budget_ring.py \
 python3 ci/tools/test_dcz_prefix_alloc.py --nginx-binary "$BIN" --port "$((p + 31))"
 python3 ci/tools/test_var_dynamic_cacheable.py \
     --nginx-binary "$BIN" --port "$((p + 32))"
+python3 ci/tools/test_cctx_early_release.py \
+    --nginx-binary "$BIN" --port "$((p + 34))" --backend-port "$((p + 35))"
 
 # The dictionary path-hardening matrix (the PR gate runs it too): every
 # strict-path refusal in the opener and the walk, the non-regular-input

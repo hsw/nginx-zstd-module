@@ -2,6 +2,15 @@ Changes with http-zstd
 
 Unreleased
 
+    *) Performance: a request now gives its compression context back as
+       soon as its zstd frame is complete (or the body filter fails), not
+       when the request ends. A worker CCtx ring slot is returned, and an
+       uncached per-request context freed, while a slow client is still
+       reading the already-compressed tail (up to zstd_buffers plus socket
+       buffers), so overlapping slow-client tails no longer keep ring
+       slots on loan. A response whose frame is still open holds its
+       context as before. No wire or configuration change.
+
     *) Performance: static-API builds now prepare RFC 9842 dictionaries once
        at configuration load as ZSTD_dct_rawContent CDicts, shared by raw
        dictionary, compression level, and every reachable clamped dcz window.
